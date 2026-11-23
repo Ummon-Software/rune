@@ -67,6 +67,7 @@ mod tests;
 #[derive(Default)]
 pub(in crate::window) struct Native {
     pub(in crate::window) activator: Option<crate::platform::activation::Activator>,
+    pub(in crate::window) wayland_drop: crate::platform::wayland_drop::Slot,
 }
 
 #[cfg(target_os = "windows")]

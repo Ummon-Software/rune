@@ -74,7 +74,18 @@ impl Host {
         let native = self.win.as_ref().map(|l| crate::platform::macos::drop::take(&l.window)).unwrap_or_default();
         #[cfg(target_os = "windows")]
         let native = self.win.as_ref().map(|l| crate::platform::win32::drop_target::take(&l.window)).unwrap_or_default();
-        #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+        #[cfg(all(unix, not(target_os = "macos"), not(target_os = "ios"), not(target_os = "android")))]
+        let native = if let Some(l) = self.win.as_mut() {
+            if self.life.shown() {
+                let handle = self.native_handle.clone();
+                l.native.wayland_drop.take(&l.window, move || handle.send(WakeEvent::FileDrop))
+            } else {
+                l.native.wayland_drop.drain_if_active()
+            }
+        } else {
+            Vec::new()
+        };
+        #[cfg(not(any(target_os = "macos", target_os = "windows", all(unix, not(target_os = "ios"), not(target_os = "android")))))]
         let native: Vec<FileStep> = Vec::new();
         let Some(l) = self.win.as_ref().filter(|_| self.life.shown()) else {
             self.files = FileDrop::default();
@@ -85,8 +96,8 @@ impl Host {
         let zoom = rt.zoom();
         let view_at = |(x, y): (f32, f32)| (x / zoom, y / zoom);
         let mut queued = false;
-        // Native drop targets (AppKit, Win32 OLE) report each step in window points; winit's
-        // fallback events omit the position, so the host samples the pointer for them.
+        // Native drop targets (AppKit, Win32 OLE, Wayland data device) report each step in window
+        // points; winit's fallback events omit the position, so the host samples the pointer.
         for step in native.into_iter().chain(std::mem::take(&mut f.steps)) {
             queued |= match step {
                 FileStep::Enter(paths, Some(p)) => { rt.drag_files(paths, Some(view_at(p))); true }
@@ -178,7 +189,7 @@ impl Host {
             WakeEvent::GpuReady(_) => self.gpu_ready(),
             #[cfg(not(target_os = "windows"))]
             WakeEvent::GpuReady(_) => {}
-            WakeEvent::Reopen | WakeEvent::Turn | WakeEvent::Quit(_) => {}
+            WakeEvent::Reopen | WakeEvent::Turn | WakeEvent::Quit(_) | WakeEvent::FileDrop(_) => {}
         }
     }
 

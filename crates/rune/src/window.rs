@@ -44,7 +44,7 @@ pub use handle::WindowHandle;
 #[cfg(not(target_arch = "wasm32"))]
 pub use event_loop::run;
 pub(crate) use event_loop::run_windows;
-#[cfg(any(target_os = "macos", target_os = "windows"))]
+#[cfg(any(test, target_os = "macos", target_os = "windows", all(unix, not(target_os = "ios"), not(target_os = "android"))))]
 pub(crate) use file_drop::FileStep;
 pub(crate) use keys::{key_base, map_key_event, map_mods};
 pub(crate) use state::frame;
@@ -114,6 +114,9 @@ pub(crate) enum WakeEvent {
     /// Windows: the GPU a CPU-drawn window was waiting for is made, or failed (`cpu_frame`).
     #[cfg_attr(not(target_os = "windows"), allow(dead_code))]
     GpuReady(usize),
+    /// Wayland: a file drag over the window changed (`platform::wayland_drop`).
+    #[cfg_attr(not(all(unix, not(target_os = "macos"), not(target_os = "ios"), not(target_os = "android"))), allow(dead_code))]
+    FileDrop(usize),
 }
 
 /// What `Windows` needs of a host, whatever its state type: an app window or an overlay.
@@ -329,7 +332,7 @@ impl ApplicationHandler<WakeEvent> for Windows {
         let slot = match &event {
             WakeEvent::DisplayTick(i) | WakeEvent::App(i) | WakeEvent::Live(i) | WakeEvent::Window(i, _) | WakeEvent::Focus(i)
                 | WakeEvent::Position(i, _) | WakeEvent::Level(i, _) | WakeEvent::Place(i, _) | WakeEvent::Frame(i, _)
-                | WakeEvent::A11y(i) | WakeEvent::FrameSlot(i) | WakeEvent::GpuReady(i) => *i,
+                | WakeEvent::A11y(i) | WakeEvent::FrameSlot(i) | WakeEvent::GpuReady(i) | WakeEvent::FileDrop(i) => *i,
             WakeEvent::Reopen => {
                 self.reopen(event_loop);
                 self.cleanup(event_loop);
