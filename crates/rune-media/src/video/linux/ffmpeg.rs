@@ -14,8 +14,13 @@ use ff::format::stream::Disposition;
 use ff::software::{resampling, scaling};
 use ff::util::format::{Pixel, Sample, sample::Type as SampleType};
 use ff::{ChannelLayout, Dictionary, Packet, Rational, frame, media};
+use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
+
+/// Maximum undecoded video packets buffered while reading ahead for audio on coarsely interleaved
+/// containers (such as fragmented MP4).
+const MAX_PENDING_VIDEO: usize = 128;
 
 static INIT: OnceLock<Result<(), String>> = OnceLock::new();
 
@@ -40,23 +45,18 @@ pub(super) struct Picture {
     pub frame: f64,
 }
 
-/// The first audio stream's native sample rate and channel count.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(super) struct Sound {
-    pub channels: u16,
-    pub rate: u32,
-}
-
 pub(super) enum DecodedItem {
     Video { pts: f64, frame: ByteFrame },
     Audio { pts: f64, samples: Vec<f32> },
+    /// Audio-only read-ahead hit EOF or the pending video packet cap; wait for video room.
+    Wait,
     Eof,
 }
 
 struct VideoTrack {
     index: usize,
     time_base: f64,
-    start_time: f64,
+    origin: f64,
     decoder: ff::decoder::Video,
     picture: Picture,
     scaler: Option<(Pixel, u32, u32, scaling::Context)>,
@@ -69,7 +69,7 @@ struct VideoTrack {
 struct AudioTrack {
     index: usize,
     time_base: f64,
-    start_time: f64,
+    origin: f64,
     decoder: ff::decoder::Audio,
     resampler: Option<(Sample, ChannelLayout, u32, OutputSpec, resampling::Context)>,
     output_spec: Option<OutputSpec>,
@@ -82,8 +82,9 @@ pub(super) struct Opened {
     ictx: ff::format::context::Input,
     video: Option<VideoTrack>,
     audio: Option<AudioTrack>,
+    pending_video: VecDeque<Packet>,
+    origin: f64,
     pub picture: Option<Picture>,
-    pub sound: Option<Sound>,
     pub has_sound: bool,
     pub duration: f64,
     demux_eof: bool,
@@ -114,9 +115,17 @@ impl Opened {
         };
         let audio_idx = ictx.streams().best(media::Type::Audio).map(|s| s.index());
 
+        let video_start = video_idx.and_then(|i| stream_start_time(&ictx, i));
+        let audio_start = audio_idx.and_then(|i| stream_start_time(&ictx, i));
+        let origin = match (video_start, audio_start) {
+            (Some(v), Some(a)) => v.min(a),
+            (Some(v), None) | (None, Some(v)) => v,
+            (None, None) => 0.0,
+        };
+
         let (video, picture, video_dur) = match video_idx {
             Some(index) => {
-                let (track, pic, dur) = open_video_track(&ictx, index)?;
+                let (track, pic, dur) = open_video_track(&ictx, index, origin)?;
                 (Some(track), Some(pic), dur)
             }
             None if kind == Kind::Video => return Err("no playable video track".into()),
@@ -124,17 +133,17 @@ impl Opened {
         };
 
         let mut has_sound = audio_idx.is_some();
-        let (audio, sound, audio_dur) = match audio_idx.filter(|_| want_audio || kind == Kind::Audio) {
-            Some(index) => match open_audio_track(&ictx, index) {
-                Ok((track, snd, dur)) => (Some(track), Some(snd), dur),
+        let (audio, audio_dur) = match audio_idx.filter(|_| want_audio || kind == Kind::Audio) {
+            Some(index) => match open_audio_track(&ictx, index, origin) {
+                Ok((track, dur)) => (Some(track), dur),
                 Err(e) if kind == Kind::Audio => return Err(e),
                 Err(_) => {
                     has_sound = false;
-                    (None, None, 0.0)
+                    (None, 0.0)
                 }
             },
             None if kind == Kind::Audio => return Err("no playable audio track".into()),
-            None => (None, None, 0.0),
+            None => (None, 0.0),
         };
 
         let duration = if container_dur > 0.0 {
@@ -147,8 +156,9 @@ impl Opened {
             ictx,
             video,
             audio,
+            pending_video: VecDeque::new(),
+            origin,
             picture,
-            sound,
             has_sound,
             duration,
             demux_eof: false,
@@ -163,11 +173,14 @@ impl Opened {
     }
 
     pub(super) fn seek(&mut self, seconds: f64) -> Result<(), String> {
-        let target = (seconds.max(0.0) * f64::from(ff::ffi::AV_TIME_BASE)) as i64;
+        let base = (self.origin * f64::from(ff::ffi::AV_TIME_BASE)) as i64;
+        let target = ((self.origin + seconds.max(0.0)) * f64::from(ff::ffi::AV_TIME_BASE)) as i64;
         self.ictx
             .seek(target, ..target)
+            .or_else(|_| self.ictx.seek(base, ..))
             .or_else(|_| self.ictx.seek(0, ..))
             .map_err(|e| format!("seek failed: {e}"))?;
+        self.pending_video.clear();
         if let Some(v) = &mut self.video {
             v.decoder.flush();
             v.eof_sent = false;
@@ -183,11 +196,26 @@ impl Opened {
     }
 
     /// Reads the next decoded video frame or resampled audio chunk, or `Eof` when all active
-    /// tracks have drained.
-    pub(super) fn next(&mut self, decode_audio: bool) -> Result<DecodedItem, String> {
+    /// tracks have drained. When `decode_video` is false, video packets are queued (up to
+    /// `MAX_PENDING_VIDEO`) so audio can keep reading ahead without dropping pictures.
+    pub(super) fn next(
+        &mut self,
+        decode_video: bool,
+        decode_audio: bool,
+    ) -> Result<DecodedItem, String> {
         loop {
-            if let Some(item) = self.receive_video()? {
-                return Ok(item);
+            if decode_video {
+                if let Some(item) = self.receive_video()? {
+                    return Ok(item);
+                }
+                while let Some(pkt) = self.pending_video.pop_front() {
+                    if let Some(v) = &mut self.video {
+                        send_video_packet(&mut v.decoder, &pkt)?;
+                    }
+                    if let Some(item) = self.receive_video()? {
+                        return Ok(item);
+                    }
+                }
             }
             if decode_audio
                 && let Some(item) = self.receive_audio()?
@@ -195,8 +223,22 @@ impl Opened {
                 return Ok(item);
             }
             if self.demux_eof {
-                let v_done = self.video.as_ref().is_none_or(|v| v.eof);
                 let a_done = !decode_audio || self.audio.as_ref().is_none_or(|a| a.eof);
+                if decode_audio
+                    && let Some(a) = &mut self.audio
+                    && !a.eof_sent
+                {
+                    a.decoder.send_eof().ok();
+                    a.eof_sent = true;
+                    continue;
+                }
+                if !decode_video && self.video.is_some() {
+                    if a_done {
+                        return Ok(DecodedItem::Wait);
+                    }
+                    continue;
+                }
+                let v_done = self.video.as_ref().is_none_or(|v| v.eof);
                 if v_done && a_done {
                     return Ok(DecodedItem::Eof);
                 }
@@ -206,14 +248,10 @@ impl Opened {
                     v.decoder.send_eof().ok();
                     v.eof_sent = true;
                 }
-                if decode_audio
-                    && let Some(a) = &mut self.audio
-                    && !a.eof_sent
-                {
-                    a.decoder.send_eof().ok();
-                    a.eof_sent = true;
-                }
                 continue;
+            }
+            if !decode_video && self.pending_video.len() >= MAX_PENDING_VIDEO {
+                return Ok(DecodedItem::Wait);
             }
             let mut packet = Packet::empty();
             match packet.read(&mut self.ictx) {
@@ -222,12 +260,16 @@ impl Opened {
                     if let Some(v) = &mut self.video
                         && v.index == idx
                     {
-                        v.decoder.send_packet(&packet).ok();
+                        if decode_video {
+                            send_video_packet(&mut v.decoder, &packet)?;
+                        } else {
+                            self.pending_video.push_back(packet);
+                        }
                     } else if decode_audio
                         && let Some(a) = &mut self.audio
                         && a.index == idx
                     {
-                        a.decoder.send_packet(&packet).ok();
+                        send_audio_packet(&mut a.decoder, &packet)?;
                     }
                 }
                 Err(ff::Error::Eof) => {
@@ -246,7 +288,7 @@ impl Opened {
         match v.decoder.receive_frame(&mut v.frame) {
             Ok(()) => {
                 let raw_pts = v.frame.timestamp().unwrap_or(0);
-                let pts = (raw_pts as f64 * v.time_base - v.start_time).max(0.0);
+                let pts = (raw_pts as f64 * v.time_base - v.origin).max(0.0);
                 let bytes = video_frame_to_bytes(v)?;
                 Ok(Some(DecodedItem::Video { pts, frame: bytes }))
             }
@@ -267,7 +309,7 @@ impl Opened {
         match a.decoder.receive_frame(&mut a.frame) {
             Ok(()) => {
                 let raw_pts = a.frame.timestamp().unwrap_or(0);
-                let pts = (raw_pts as f64 * a.time_base - a.start_time).max(0.0);
+                let pts = (raw_pts as f64 * a.time_base - a.origin).max(0.0);
                 let samples = audio_frame_to_f32(a)?;
                 Ok(Some(DecodedItem::Audio { pts, samples }))
             }
@@ -279,6 +321,32 @@ impl Opened {
             Err(e) => Err(format!("audio decode error: {e}")),
         }
     }
+}
+
+fn send_video_packet(decoder: &mut ff::decoder::Video, packet: &Packet) -> Result<(), String> {
+    match decoder.send_packet(packet) {
+        Ok(()) | Err(ff::Error::InvalidData) => Ok(()),
+        Err(ff::Error::Other { errno }) if errno == libc::EAGAIN => Ok(()),
+        Err(e) => Err(format!("video decode error: {e}")),
+    }
+}
+
+fn send_audio_packet(decoder: &mut ff::decoder::Audio, packet: &Packet) -> Result<(), String> {
+    match decoder.send_packet(packet) {
+        Ok(()) | Err(ff::Error::InvalidData) => Ok(()),
+        Err(ff::Error::Other { errno }) if errno == libc::EAGAIN => Ok(()),
+        Err(e) => Err(format!("audio decode error: {e}")),
+    }
+}
+
+fn stream_start_time(ictx: &ff::format::context::Input, index: usize) -> Option<f64> {
+    let stream = ictx.stream(index)?;
+    let start = stream.start_time();
+    if start == ff::ffi::AV_NOPTS_VALUE {
+        return None;
+    }
+    let tb = rational_f64(stream.time_base())?;
+    Some(start as f64 * tb)
 }
 
 fn pick_video_stream(ictx: &ff::format::context::Input) -> Option<usize> {
@@ -298,14 +366,10 @@ fn pick_video_stream(ictx: &ff::format::context::Input) -> Option<usize> {
 fn open_video_track(
     ictx: &ff::format::context::Input,
     index: usize,
+    origin: f64,
 ) -> Result<(VideoTrack, Picture, f64), String> {
     let stream = ictx.stream(index).ok_or("missing video stream")?;
     let time_base = rational_f64(stream.time_base()).unwrap_or(1.0 / 90_000.0);
-    let start_time = if stream.start_time() != ff::ffi::AV_NOPTS_VALUE {
-        stream.start_time() as f64 * time_base
-    } else {
-        0.0
-    };
     let dur = if stream.duration() > 0 && stream.duration() != ff::ffi::AV_NOPTS_VALUE {
         stream.duration() as f64 * time_base
     } else {
@@ -360,7 +424,7 @@ fn open_video_track(
     let track = VideoTrack {
         index,
         time_base,
-        start_time,
+        origin,
         decoder,
         picture,
         scaler: None,
@@ -375,14 +439,10 @@ fn open_video_track(
 fn open_audio_track(
     ictx: &ff::format::context::Input,
     index: usize,
-) -> Result<(AudioTrack, Sound, f64), String> {
+    origin: f64,
+) -> Result<(AudioTrack, f64), String> {
     let stream = ictx.stream(index).ok_or("missing audio stream")?;
     let time_base = rational_f64(stream.time_base()).unwrap_or(1.0 / 48_000.0);
-    let start_time = if stream.start_time() != ff::ffi::AV_NOPTS_VALUE {
-        stream.start_time() as f64 * time_base
-    } else {
-        0.0
-    };
     let dur = if stream.duration() > 0 && stream.duration() != ff::ffi::AV_NOPTS_VALUE {
         stream.duration() as f64 * time_base
     } else {
@@ -394,14 +454,10 @@ fn open_audio_track(
         .decoder()
         .audio()
         .map_err(|e| format!("no audio decoder for this codec: {e}"))?;
-    let sound = Sound {
-        channels: decoder.channels().clamp(1, 8),
-        rate: decoder.rate().max(8_000),
-    };
     let track = AudioTrack {
         index,
         time_base,
-        start_time,
+        origin,
         decoder,
         resampler: None,
         output_spec: None,
@@ -409,7 +465,7 @@ fn open_audio_track(
         eof_sent: false,
         eof: false,
     };
-    Ok((track, sound, dur))
+    Ok((track, dur))
 }
 
 fn video_frame_to_bytes(v: &mut VideoTrack) -> Result<ByteFrame, String> {
@@ -421,7 +477,7 @@ fn video_frame_to_bytes(v: &mut VideoTrack) -> Result<ByteFrame, String> {
     let even = w.is_multiple_of(2) && h.is_multiple_of(2);
     let fmt = v.frame.format();
     let color = v.picture.color;
-    let nv12_fmt = if v.frame.color_range() == Range::JPEG {
+    let nv12_fmt = if fmt == Pixel::YUVJ420P || v.frame.color_range() == Range::JPEG {
         Format::Nv12Full
     } else if v.frame.color_range() == Range::MPEG {
         Format::Nv12Video
@@ -435,7 +491,7 @@ fn video_frame_to_bytes(v: &mut VideoTrack) -> Result<ByteFrame, String> {
     if even && fmt == Pixel::NV12 {
         return Ok(pack_nv12(&v.frame, w, h, nv12_fmt, color));
     }
-    if even && fmt == Pixel::YUV420P {
+    if even && matches!(fmt, Pixel::YUV420P | Pixel::YUVJ420P) {
         return Ok(pack_yuv420p_to_nv12(&v.frame, w, h, nv12_fmt, color));
     }
 
@@ -599,6 +655,11 @@ fn rational_f64(r: Rational) -> Option<f64> {
         .then(|| f64::from(r.numerator()) / f64::from(r.denominator()))
 }
 
+/// Self-contained container demuxers allowed for local files; excludes playlist/multi-file
+/// demuxers (hls, concat, dash, image2, etc.) so local blobs cannot open secondary files.
+const LOCAL_FORMATS: &str =
+    "mov,mp4,m4a,3gp,3g2,mj2,matroska,webm,ogg,mp3,aac,wav,flac,aiff,avi,mpegts,flv,asf,caf,amr";
+
 fn resolve_source(
     source: &MediaSource,
     headers: &[(String, String)],
@@ -608,12 +669,16 @@ fn resolve_source(
         MediaSource::File(path) => {
             let path = validate_local_file(path)?;
             opts.set("protocol_whitelist", "file");
+            opts.set("format_whitelist", LOCAL_FORMATS);
+            opts.set("enable_drefs", "0");
             Ok((path, opts))
         }
         MediaSource::Url(url) if url.get(..5).is_some_and(|p| p.eq_ignore_ascii_case("file:")) => {
             let path = parse_file_url(url)?;
             let path = validate_local_file(&path)?;
             opts.set("protocol_whitelist", "file");
+            opts.set("format_whitelist", LOCAL_FORMATS);
+            opts.set("enable_drefs", "0");
             Ok((path, opts))
         }
         MediaSource::Url(url) if url.starts_with("http://") || url.starts_with("https://") => {

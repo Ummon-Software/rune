@@ -142,19 +142,25 @@ impl Drop for Output {
     }
 }
 
-/// Prefers PulseAudio (which connects natively to PipeWire via pipewire-pulse as well as
-/// PulseAudio), falling back to the default ALSA host.
-fn pick_host() -> Host {
-    if let Ok(host) = cpal::host_from_id(HostId::PulseAudio)
-        && host.default_output_device().is_some()
-    {
-        return host;
+fn open_stream(feed: Arc<Mutex<Feed>>, clock: Arc<Clock>) -> Result<(Stream, OutputSpec), String> {
+    let mut last_err = None;
+    for id in [HostId::PulseAudio, HostId::Alsa] {
+        match cpal::host_from_id(id)
+            .map_err(|e| e.to_string())
+            .and_then(|host| open_stream_on(&host, feed.clone(), clock.clone()))
+        {
+            Ok(opened) => return Ok(opened),
+            Err(e) => last_err = Some(e),
+        }
     }
-    cpal::default_host()
+    Err(last_err.unwrap_or_else(|| "no sound output device".into()))
 }
 
-fn open_stream(feed: Arc<Mutex<Feed>>, clock: Arc<Clock>) -> Result<(Stream, OutputSpec), String> {
-    let host = pick_host();
+fn open_stream_on(
+    host: &Host,
+    feed: Arc<Mutex<Feed>>,
+    clock: Arc<Clock>,
+) -> Result<(Stream, OutputSpec), String> {
     let device = host.default_output_device().ok_or("no sound output device")?;
     let supported = device
         .default_output_config()

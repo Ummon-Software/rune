@@ -4,7 +4,7 @@
 
 use super::super::{Kind, MediaSource, Meta};
 use super::audio::{self, Output};
-use super::ffmpeg::{DecodedItem, Opened, Picture, Sound};
+use super::ffmpeg::{DecodedItem, Opened, Picture};
 use crate::native_surface::ByteFrame;
 use rune_core::time::Instant;
 use std::collections::VecDeque;
@@ -49,7 +49,7 @@ pub(super) enum News {
 pub(super) struct Facts {
     pub meta: Meta,
     pub picture: Option<Picture>,
-    pub sound: Option<Sound>,
+    pub has_sound: bool,
 }
 
 pub(super) struct Decoded {
@@ -128,6 +128,7 @@ struct Decoder {
     opened: Opened,
     facts: Facts,
     output: Option<Output>,
+    audio_failed: bool,
 }
 
 impl Decoder {
@@ -142,17 +143,17 @@ impl Decoder {
             frame: opened.picture.map_or(1.0 / 30.0, |p| p.frame),
             sound: opened.has_sound,
         };
-        let facts = Facts { meta, picture: opened.picture, sound: opened.sound };
-        let mut d = Self { opened, facts, output: None };
+        let facts = Facts { meta, picture: opened.picture, has_sound: opened.has_sound };
+        let mut d = Self { opened, facts, output: None, audio_failed: false };
         d.select_sound(job.sound.is_some() || job.kind == Kind::Audio, &job.clock);
         Ok(d)
     }
 
     fn select_sound(&mut self, on: bool, clock: &Arc<audio::Clock>) {
-        if self.facts.sound.is_none() {
+        if !self.facts.has_sound {
             return;
         }
-        if on && self.output.is_none() {
+        if on && self.output.is_none() && !self.audio_failed {
             match Output::open(clock.clone()) {
                 Ok(output) => {
                     self.opened.set_audio_output(Some(output.spec()));
@@ -160,12 +161,14 @@ impl Decoder {
                 }
                 Err(e) => {
                     eprintln!("rune: no sound for the clip: {e}");
+                    self.audio_failed = true;
                     self.opened.set_audio_output(None);
                 }
             }
         }
         if !on {
             self.output = None;
+            self.audio_failed = false;
             self.opened.set_audio_output(None);
         }
     }
@@ -177,8 +180,13 @@ impl Decoder {
         let mut waiting_since = rune_core::time::now();
         let mut end_due: Option<f64> = None;
         let mut last_audio_end: f64 = job.start;
+        let mut ever_decoded = false;
+        let mut sent_video = false;
+        let mut last_skipped: Option<(f64, ByteFrame)> = None;
+        let mut audio_wait = false;
 
         loop {
+            let decode_video;
             {
                 let mut s = pipe.lock();
                 loop {
@@ -194,25 +202,78 @@ impl Decoder {
                         skip_before = to;
                         epoch = 0.0;
                         last_audio_end = to;
+                        sent_video = false;
+                        last_skipped = None;
+                        audio_wait = false;
                         self.opened.seek(to)?;
                         if let Some(o) = &self.output {
                             o.flush();
                         }
                     }
-                    if self.output.is_some() != s.sound.is_some() {
-                        let on = s.sound.is_some();
+                    let want_sound = s.sound.is_some();
+                    let sound_change = (want_sound && self.output.is_none() && !self.audio_failed)
+                        || (!want_sound && (self.output.is_some() || self.audio_failed));
+                    if sound_change {
+                        let had_output = self.output.is_some();
+                        audio_wait = false;
                         drop(s);
-                        self.select_sound(on, &job.clock);
+                        self.select_sound(want_sound, &job.clock);
                         s = pipe.lock();
+                        if !had_output && self.output.is_some() && job.kind == Kind::Audio {
+                            let cur = job
+                                .clock
+                                .get()
+                                .map(|c| c.position(rune_core::time::now()).max(0.0));
+                            let pos = cur.unwrap_or(skip_before);
+                            let dur = self.facts.meta.duration;
+                            let to = if dur > 0.0 && s.looping {
+                                pos.rem_euclid(dur)
+                            } else if dur > 0.0 {
+                                pos.min(dur)
+                            } else {
+                                pos
+                            };
+                            epoch = if dur > 0.0 && s.looping {
+                                (pos / dur).floor() * dur
+                            } else {
+                                0.0
+                            };
+                            skip_before = to;
+                            last_audio_end = pos;
+                            end_due = None;
+                            s.ended = None;
+                            s.audio_end = None;
+                            self.opened.seek(to)?;
+                            if let Some(o) = &self.output {
+                                o.flush();
+                            }
+                        }
                     }
                     if let (Some(o), Some(gain)) = (&self.output, s.sound) {
                         o.set_gain(gain);
                     }
-                    let ended = s.ended == Some(generation);
                     let has_video = self.facts.picture.is_some();
-                    let room = s.frames.len() < AHEAD || !has_video;
+                    let silent_audio_ready =
+                        !has_video && self.output.is_none() && ever_decoded;
+                    if silent_audio_ready && !s.looping && s.ended != Some(generation) {
+                        let dur_end = epoch + self.facts.meta.duration;
+                        s.ended = Some(generation);
+                        s.audio_end = Some(dur_end);
+                        end_due = Some(dur_end);
+                    }
+                    let ended = s.ended == Some(generation);
+                    let room = s.frames.len() < AHEAD;
                     let sound_full = self.output.as_ref().is_some_and(Output::full);
-                    if !ended && room && !(sound_full && !has_video) {
+                    let need_sound = self.output.is_some() && !sound_full && !audio_wait;
+                    if !ended
+                        && ((has_video && room)
+                            || (!has_video && !sound_full && !silent_audio_ready)
+                            || need_sound)
+                    {
+                        decode_video = has_video && room;
+                        if decode_video {
+                            audio_wait = false;
+                        }
                         break;
                     }
                     let touched = s.touched.unwrap_or(waiting_since);
@@ -231,7 +292,11 @@ impl Decoder {
                         (job.notify)();
                         return Ok(());
                     }
-                    let patience = if sound_full { SOUND_POLL } else { PARK };
+                    let patience = if sound_full && playing_sound && !audio_wait {
+                        SOUND_POLL
+                    } else {
+                        PARK
+                    };
                     let patience = heard_end.map_or(patience, |at| {
                         patience.min(
                             at.saturating_duration_since(rune_core::time::now())
@@ -243,11 +308,16 @@ impl Decoder {
                 }
             }
 
-            let decode_audio = self.output.is_some();
-            match self.opened.next(decode_audio)? {
+            let decode_audio = self.output.is_some() || job.kind == Kind::Audio;
+            match self.opened.next(decode_video, decode_audio)? {
                 DecodedItem::Video { pts, frame } => {
+                    if job.kind == Kind::Video {
+                        ever_decoded = true;
+                    }
+                    let unwrapped = epoch + pts;
                     if pts + self.facts.meta.frame * 0.5 >= skip_before {
-                        let unwrapped = epoch + pts;
+                        sent_video = true;
+                        last_skipped = None;
                         let mut s = pipe.lock();
                         let was_empty = s.frames.is_empty();
                         s.frames.push_back(Decoded { generation, pts: unwrapped, frame });
@@ -255,9 +325,14 @@ impl Decoder {
                         if was_empty {
                             (job.notify)();
                         }
+                    } else {
+                        last_skipped = Some((unwrapped, frame));
                     }
                 }
                 DecodedItem::Audio { pts, samples } => {
+                    if job.kind == Kind::Audio {
+                        ever_decoded = true;
+                    }
                     if let Some(o) = &self.output {
                         let spec = o.spec();
                         let frames = samples.len() / usize::from(spec.channels).max(1);
@@ -268,11 +343,23 @@ impl Decoder {
                         o.push(samples, epoch + pts, skip_before);
                     }
                 }
+                DecodedItem::Wait => {
+                    audio_wait = true;
+                }
                 DecodedItem::Eof => {
+                    let seeked_to_end = skip_before > 0.0
+                        && self.facts.meta.duration > 0.0
+                        && skip_before >= self.facts.meta.duration;
+                    if !ever_decoded && !seeked_to_end {
+                        return Err("no decodable frames in clip".into());
+                    }
                     let looping = pipe.lock().looping;
                     if looping && self.facts.meta.duration > 0.0 {
                         epoch += self.facts.meta.duration;
                         skip_before = 0.0;
+                        sent_video = false;
+                        last_skipped = None;
+                        audio_wait = false;
                         self.opened.seek(0.0)?;
                     } else {
                         let audio_end = if job.kind == Kind::Audio {
@@ -283,6 +370,12 @@ impl Decoder {
                         };
                         {
                             let mut s = pipe.lock();
+                            if !sent_video
+                                && let Some((pts, frame)) = last_skipped.take()
+                            {
+                                sent_video = true;
+                                s.frames.push_back(Decoded { generation, pts, frame });
+                            }
                             s.ended = Some(generation);
                             s.audio_end = audio_end;
                         }

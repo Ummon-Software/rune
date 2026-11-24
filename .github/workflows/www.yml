@@ -92,23 +92,16 @@ jobs:
       # The native app (tests and the `--html` export) links winit's keyboard library. Its packages are cached, so a
       # run doesn't need the Ubuntu mirrors (on 2026-11-11 the runners couldn't resolve them for over an hour, and
       # every run failed here); a run that must fetch them retries.
-      - uses: actions/cache@v4
-        id: debs
-        with:
-          path: ~/.debs
-          key: debs-libxkbcommon-${{ runner.os }}-${{ runner.arch }}-${{ env.ImageOS }}
       - name: Native libraries
         run: |
-          if [ "${{ steps.debs.outputs.cache-hit }}" != true ]; then
-            mkdir -p ~/.debs
-            for attempt in 1 2 3; do
-              sudo apt-get -o Acquire::Retries=3 update &&
-                (cd ~/.debs && apt-get -o Acquire::Retries=3 download libxkbcommon-dev libxkbcommon0) && break
-              [ "$attempt" = 3 ] && exit 1
-              sleep $((attempt * 20))
-            done
-          fi
-          sudo dpkg -i ~/.debs/*.deb
+          for attempt in 1 2 3; do
+            sudo apt-get -o Acquire::Retries=3 update &&
+              sudo apt-get -o Acquire::Retries=3 install -y --no-install-recommends \
+                libxkbcommon-dev pkg-config libclang-dev libasound2-dev \
+                libavformat-dev libavcodec-dev libavutil-dev libswscale-dev libswresample-dev && break
+            [ "$attempt" = 3 ] && exit 1
+            sleep $((attempt * 20))
+          done
       - name: Test the page
         working-directory: .
         run: cargo test -p rune-www

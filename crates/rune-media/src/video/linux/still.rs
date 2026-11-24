@@ -64,7 +64,7 @@ impl FrameSource for Still {
             self.current = self.next.take();
         }
         loop {
-            match self.opened.next(false)? {
+            match self.opened.next(true, false)? {
                 DecodedItem::Video { pts, frame } => {
                     if !shows(pts) && self.current.is_some() {
                         self.next = Some((pts, frame));
@@ -72,7 +72,7 @@ impl FrameSource for Still {
                     }
                     self.current = Some((pts, frame));
                 }
-                DecodedItem::Audio { .. } => {}
+                DecodedItem::Audio { .. } | DecodedItem::Wait => {}
                 DecodedItem::Eof => break,
             }
         }

@@ -70,7 +70,7 @@ pub(super) fn created(shared: &Arc<Shared>) {
 }
 
 pub(super) fn enable() {
-    let clips: Vec<(Arc<Shared>, fn(&Arc<Shared>))> = {
+    let clips: Vec<_> = {
         let mut pending = PENDING_AUDIO.lock().unwrap_or_else(|e| e.into_inner());
         pending.drain(..).filter_map(|(w, f)| w.upgrade().map(|s| (s, f))).collect()
     };
@@ -122,7 +122,7 @@ pub(super) fn apply(shared: &Arc<Shared>) {
 
 /// Audio, from any thread (an edit, or its decoder's news): fold everything in.
 pub(super) fn drive(shared: &Arc<Shared>) {
-    let Ok(mut native) = shared.native.try_lock() else { return };
+    let mut native = shared.native.lock().unwrap_or_else(|e| e.into_inner());
     let mut c = shared.ctl.lock().unwrap_or_else(|e| e.into_inner());
     let now = rune_core::time::now();
     native.reconcile(shared, &mut c, now, true);
@@ -237,18 +237,28 @@ impl Native {
                     }
                     self.shown = None;
                 }
-                Effect::Clock(anchor) => self.clock.set(anchor),
+                Effect::Clock(anchor) => {
+                    self.clock.set(anchor);
+                    if let Some(pipe) = &self.pipe {
+                        pipe.poke();
+                    }
+                }
             }
         }
     }
 
     fn open(&mut self, shared: &Arc<Shared>, c: &Control, at: f64) {
         let weak = Arc::downgrade(shared);
+        let start = match c.duration.filter(|d| *d > 0.0) {
+            Some(d) if c.looping => at.rem_euclid(d),
+            Some(d) => at.clamp(0.0, d),
+            None => at.max(0.0),
+        };
         let job = Job {
             source: shared.source.clone(),
             headers: shared.headers.clone(),
             kind: shared.kind,
-            start: c.duration.filter(|d| *d > 0.0).map_or(at, |d| at.rem_euclid(d)),
+            start,
             generation: self.seeks.current().0,
             looping: c.looping,
             sound: (!c.muted).then_some(c.volume),
@@ -266,7 +276,7 @@ impl Native {
 
     /// Sound is playing: the clip's clock runs on whether or not it's drawn.
     fn sounding(&self, c: &Control) -> bool {
-        !c.muted && self.facts.is_some_and(|f| f.sound.is_some())
+        !c.muted && self.facts.is_some_and(|f| f.has_sound)
     }
 
     /// Folds the decoder's news and the handle's intent into the phase.
@@ -309,6 +319,7 @@ impl Native {
             return;
         }
         if let Some(to) = c.seek.take() {
+            self.shown = None;
             self.event(shared, c, Event::Seek { to });
         }
         if c.playing() != self.playing {
@@ -407,11 +418,12 @@ impl Native {
         pipe.poke();
         let pts = frame.pts;
         self.put(c, surface, frame);
-        if let Phase::Buffering { .. } = self.phase {
+        if let Phase::Buffering { at, .. } = self.phase {
+            let start = pts.min(at);
             self.event(
                 shared,
                 c,
-                Event::Shown { pts, target, lead, rate: f64::from(c.rate) },
+                Event::Shown { pts: start, target, lead, rate: f64::from(c.rate) },
             );
         }
     }
@@ -424,7 +436,6 @@ impl Native {
         generation: u32,
         target: Instant,
     ) {
-        let Phase::Playing { clock } = self.phase else { return };
         let (empty, ended) = {
             let inbox = pipe.lock();
             (inbox.frames.is_empty(), inbox.ended == Some(generation))
@@ -432,9 +443,16 @@ impl Native {
         if !empty {
             return;
         }
+        let duration = c.duration.unwrap_or(0.0);
+        if let Phase::Buffering { at, .. } = self.phase {
+            if ended {
+                self.end(shared, c, at, duration);
+            }
+            return;
+        }
+        let Phase::Playing { clock } = self.phase else { return };
         let pos = clock.position(target);
         let frame = self.facts.map_or(1.0 / 30.0, |f| f.meta.frame);
-        let duration = c.duration.unwrap_or(0.0);
         let shown = self.shown.unwrap_or(clock.pos);
         if ended {
             let end = if duration > 0.0 {
