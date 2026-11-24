@@ -351,8 +351,10 @@ impl Native {
             self.event(shared, c, Event::Rate { target, rate: f64::from(c.rate) });
         }
         let sound = self.sounding(c).then_some(c.volume);
+        let position = self.at();
         if let Some(pipe) = &self.pipe {
             let mut inbox = pipe.lock();
+            inbox.position = position;
             if inbox.looping != c.looping || inbox.sound != sound {
                 inbox.looping = c.looping;
                 inbox.sound = sound;

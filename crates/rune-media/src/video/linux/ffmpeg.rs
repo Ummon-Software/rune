@@ -47,7 +47,7 @@ pub(super) struct Picture {
 
 pub(super) enum DecodedItem {
     Video { pts: f64, frame: ByteFrame },
-    Audio { pts: f64, samples: Vec<f32> },
+    Audio { pts: f64, duration: f64, samples: Vec<f32> },
     /// Audio-only read-ahead hit EOF or the pending video packet cap; wait for video room.
     Wait,
     Eof,
@@ -310,8 +310,9 @@ impl Opened {
             Ok(()) => {
                 let raw_pts = a.frame.timestamp().unwrap_or(0);
                 let pts = (raw_pts as f64 * a.time_base - a.origin).max(0.0);
+                let duration = a.frame.samples() as f64 / f64::from(a.frame.rate().max(1));
                 let samples = audio_frame_to_f32(a)?;
-                Ok(Some(DecodedItem::Audio { pts, samples }))
+                Ok(Some(DecodedItem::Audio { pts, duration, samples }))
             }
             Err(ff::Error::Other { errno }) if errno == libc::EAGAIN => Ok(None),
             Err(ff::Error::Eof) => {

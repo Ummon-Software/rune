@@ -27,6 +27,8 @@ pub(super) struct Inbox {
     pub looping: bool,
     /// Play sound, at this gain (unmuted, and the clip has some).
     pub sound: Option<f32>,
+    /// Current playhead seconds when paused, so unmuting while paused resumes there.
+    pub position: f64,
     pub stop: bool,
     /// When a frame last drew the clip.
     pub touched: Option<Instant>,
@@ -92,6 +94,7 @@ pub(super) fn start(job: Job) -> Arc<Pipe> {
         inbox: Mutex::new(Inbox {
             looping: job.looping,
             sound: job.sound,
+            position: job.start,
             touched: Some(rune_core::time::now()),
             ..Inbox::default()
         }),
@@ -224,7 +227,7 @@ impl Decoder {
                                 .clock
                                 .get()
                                 .map(|c| c.position(rune_core::time::now()).max(0.0));
-                            let pos = cur.unwrap_or(skip_before);
+                            let pos = cur.unwrap_or(s.position).max(0.0);
                             let dur = self.facts.meta.duration;
                             let to = if dur > 0.0 && s.looping {
                                 pos.rem_euclid(dur)
@@ -253,8 +256,10 @@ impl Decoder {
                         o.set_gain(gain);
                     }
                     let has_video = self.facts.picture.is_some();
-                    let silent_audio_ready =
-                        !has_video && self.output.is_none() && ever_decoded;
+                    let silent_audio_ready = !has_video
+                        && self.output.is_none()
+                        && ever_decoded
+                        && self.facts.meta.duration > 0.0;
                     if silent_audio_ready && !s.looping && s.ended != Some(generation) {
                         let dur_end = epoch + self.facts.meta.duration;
                         s.ended = Some(generation);
@@ -329,17 +334,15 @@ impl Decoder {
                         last_skipped = Some((unwrapped, frame));
                     }
                 }
-                DecodedItem::Audio { pts, samples } => {
+                DecodedItem::Audio { pts, duration, samples } => {
                     if job.kind == Kind::Audio {
                         ever_decoded = true;
                     }
+                    let chunk_end = epoch + pts + duration;
+                    if chunk_end > last_audio_end {
+                        last_audio_end = chunk_end;
+                    }
                     if let Some(o) = &self.output {
-                        let spec = o.spec();
-                        let frames = samples.len() / usize::from(spec.channels).max(1);
-                        let chunk_end = epoch + pts + frames as f64 / f64::from(spec.rate);
-                        if chunk_end > last_audio_end {
-                            last_audio_end = chunk_end;
-                        }
                         o.push(samples, epoch + pts, skip_before);
                     }
                 }
