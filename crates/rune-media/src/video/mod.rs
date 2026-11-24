@@ -26,10 +26,17 @@
 //! On Windows, Media Foundation decodes on a thread per clip, on the GPU where it can, into
 //! shared NV12 textures Rune samples in place; WASAPI plays the sound (`windows`).
 //!
+//! On Linux, FFmpeg decodes on a thread per clip into NV12/BGRA frames and `cpal` plays sound
+//! through PipeWire/PulseAudio (with ALSA fallback) (`linux`).
+//!
 //! Other platforms report [`PlayerState::Failed`] and draw a neutral placeholder for video.
 
 #[cfg(all(target_os = "macos", feature = "ogg-audio"))]
 mod foreign;
+#[cfg(target_os = "linux")]
+mod linux;
+#[cfg(target_os = "linux")]
+use self::linux as backend;
 #[cfg(target_os = "macos")]
 mod macos;
 #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
@@ -41,9 +48,9 @@ pub(crate) use macos::test_frames;
 #[cfg(any(target_os = "macos", test))]
 #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 mod turn;
-#[cfg(not(any(target_os = "macos", target_os = "windows")))]
+#[cfg(not(any(target_os = "macos", target_os = "windows", target_os = "linux")))]
 mod unsupported;
-#[cfg(not(any(target_os = "macos", target_os = "windows")))]
+#[cfg(not(any(target_os = "macos", target_os = "windows", target_os = "linux")))]
 use unsupported as backend;
 #[cfg(target_os = "windows")]
 mod windows;

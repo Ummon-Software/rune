@@ -13,7 +13,7 @@ use rune::{AppSpec, Cx, El, Key, KeyEvent, Player, PlayerState, SurfaceFit, Tx, 
 use std::time::Duration;
 
 const WIDTH: f32 = 480.0;
-const AUDIO: &[&str] = &["mp3", "m4a", "aac", "wav", "aif", "aiff", "flac", "ogg"];
+const AUDIO: &[&str] = &["mp3", "m4a", "aac", "wav", "aif", "aiff", "flac", "ogg", "opus"];
 
 struct Viewer {
     clip: Player,
