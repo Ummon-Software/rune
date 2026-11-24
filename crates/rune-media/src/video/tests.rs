@@ -52,8 +52,8 @@ fn extensions_come_from_the_last_path_segment() {
     assert_eq!(ext("sounds/clip."), None);
 }
 
-/// Windows reads WebM and Ogg when the system has their extensions, so it finds out on open.
-#[cfg(not(target_os = "windows"))]
+/// Windows and Linux read WebM and Ogg via their system decoders, so they find out on open.
+#[cfg(not(any(target_os = "windows", target_os = "linux")))]
 #[test]
 fn webm_video_fails_at_once() {
     let a = Player::url("https://example.com/clips/tap.webm?v=2");
@@ -107,7 +107,7 @@ fn the_waker_hears_each_state_change_once() {
 
 /// An unsupported format fails inside the constructor, before any waker can be set: setting
 /// one afterwards still delivers that failure, once.
-#[cfg(not(target_os = "windows"))]
+#[cfg(not(any(target_os = "windows", target_os = "linux")))]
 #[test]
 fn a_waker_set_after_a_failure_hears_it_once() {
     let a = Player::url("tap.ogv");

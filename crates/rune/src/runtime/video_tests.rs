@@ -34,9 +34,9 @@ fn failures_draw_a_placeholder_and_stop_drawing() {
     let mut rt = crate::Runtime::new(v.clone(), view, (32.0, 18.0), crate::Env::new(true, 2.0));
     rt.frame(0.0);
     let PlayerState::Failed(message) = v.state() else { panic!("{:?}", v.state()) };
-    #[cfg(any(target_os = "macos", target_os = "windows"))]
+    #[cfg(any(target_os = "macos", target_os = "windows", target_os = "linux"))]
     assert!(message.contains("no such file"), "{message}");
-    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+    #[cfg(not(any(target_os = "macos", target_os = "windows", target_os = "linux")))]
     assert_eq!(message, "video playback isn't supported on this platform yet");
     let frame = v.surface().latest().expect("placeholder frame");
     assert_eq!((frame.size, frame.format), ([32, 18], Format::Bgra));

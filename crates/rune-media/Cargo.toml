@@ -60,6 +60,10 @@ windows-sys = { workspace = true, features = ["Win32_Graphics_Dwm", "Win32_Syste
 [target.'cfg(target_os = "linux")'.dependencies]
 # The window GPU's render node, for dmabuf producers (`native_surface::linux`): wgpu-hal's version.
 ash = "0.38"
+# Audio playback on Linux (`video::linux::audio`): PulseAudio (including pipewire-pulse) with ALSA fallback.
+cpal = { version = "0.18", features = ["pulseaudio"] }
+# Video and audio demux/decode on Linux (`video::linux::ffmpeg`), dynamically linking system shared libav*.
+ffmpeg-next = { version = "9.1", default-features = false, features = ["format", "codec", "software-scaling", "software-resampling"] }
 libc = { workspace = true }
 
 # wgpu's Vulkan backend everywhere but Windows (D3D12 above) and Apple (Metal above).
